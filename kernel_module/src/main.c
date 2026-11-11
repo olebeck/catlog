@@ -31,6 +31,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <psp2kern/kernel/threadmgr.h>
 #include <psp2kern/kernel/utils.h>
 #include <psp2kern/netps.h>
+#include <psp2kern/udcd.h>
 #include <stdarg.h>
 #include <taihen.h>
 
@@ -38,7 +39,17 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #define DEFAULT_PORT 9999
 #define RINGBUF_LEN 0x2000
 
+#define SERIAL_BUSY 0x0
+#define SERIAL_READY 0x1
+#define SERIAL_STOP 0x2
+
+#define HOOKS_NUM 3
+
+static RingBuf net_ring;
+static RingBuf usb_ring;
+
 int module_get_export_func(SceUID pid, const char *modname, uint32_t libnid, uint32_t funcnid, uintptr_t *func);
+int module_get_offset(SceUID pid, SceUID modid, int segidx, uint32_t offset, uintptr_t *func);
 
 #define DECL_FUNC_HOOK(name, ...)                                                                                 \
   static tai_hook_ref_t name##HookRef;                                                                            \
@@ -62,7 +73,21 @@ CatLogConfig_t Config;
 static int net_thread_run    = 0;
 static SceUID net_thread_uid = 0;
 
+static int g_usb_running    = 0;
+static SceUID g_usb_thread_uid = -1;
+static SceUID g_usb_flag_uid = -1;
+
+static SceUID hook[HOOKS_NUM];
+static tai_hook_ref_t hook_ref[HOOKS_NUM];
+
 static SceNetSockaddrIn server;
+
+int (*sceUsbSerialStatusForDriver)();
+int (*sceUsbSerialStartForDriver)();
+int (*sceUsbSerialCloseForDriver)();
+int (*sceUsbSerialSetupForDriver)(int);
+int (*SceUsbSerialForDriver_6AA4EFA4)();
+int (*sceUsbSerialSendForDriver)(const void *buffer, unsigned int len, int unk1, int unk2);
 
 int (*sceDebugRegisterPutcharHandlerForKernel)(int (*func)(void *args, char c), void *args);
 int (*sceDebugSetHandlersForKernel)(int (*func)(int unk, const char *format, const va_list args), void *args);
@@ -73,7 +98,8 @@ int (*sceKernelSetAssertLevelForKernel)(int level);
 int UserDebugPrintfCallback(void *args, char c)
 {
   (void)args;
-  ringbuf_put_clobber(&c, 1);
+  ringbuf_put_clobber(&net_ring, &c, 1);
+  ringbuf_put_clobber(&usb_ring, &c, 1);
   return 0;
 }
 
@@ -86,7 +112,8 @@ int KernelDebugPrintfCallback(int unk, const char *fmt, const va_list args)
   int len     = vsnprintf(buf, buf_len, fmt, args);
   len         = len < 0 ? 0 : len;
   len         = len >= buf_len ? buf_len - 1 : len;
-  ringbuf_put_clobber(buf, len);
+  ringbuf_put_clobber(&net_ring, buf, len);
+  ringbuf_put_clobber(&usb_ring, buf, len);
   return 0;
 }
 
@@ -160,7 +187,7 @@ static int net_thread(SceSize args, void *argp)
   while (net_thread_run)
   {
     char buf[0x400];
-    int received_len = ringbuf_get_wait(buf, sizeof(buf), NULL);
+    int received_len = ringbuf_get_wait(&net_ring, buf, sizeof(buf), NULL);
     if (received_len == 0)
     {
       continue;
@@ -179,7 +206,7 @@ static int net_thread(SceSize args, void *argp)
       goto connect;
     }
 
-    received_len = ringbuf_get_wait(buf, sizeof(buf), (SceUInt[]) {1000 * 1000});
+    received_len = ringbuf_get_wait(&net_ring, buf, sizeof(buf), (SceUInt[]) {1000 * 1000});
 
     if (received_len > 0)
     {
@@ -187,6 +214,99 @@ static int net_thread(SceSize args, void *argp)
     }
 
     net_close(net_sock);
+  }
+
+  return 0;
+}
+
+static void usb_serial_stop(void)
+{
+  SceUsbSerialForDriver_6AA4EFA4();
+  sceUsbSerialCloseForDriver();
+}
+
+static int SceUsbMtpForDriver_6FC97594_patched(void)
+{
+  return 0;
+}
+
+static int sceUsbstorVStorStart_patched(int r0)
+{
+  ksceKernelWaitEventFlag(g_usb_flag_uid, SERIAL_READY, SCE_EVENT_WAITCLEAR, NULL, 0);
+  usb_serial_stop();
+  ksceUdcdStopCurrentInternal(2);
+  return TAI_CONTINUE(int, hook_ref[1], r0);
+}
+
+static int sceUsbstorVStorStop_patched(void)
+{
+  ksceUdcdStopCurrentInternal(2);
+  ksceKernelSetEventFlag(g_usb_flag_uid, SERIAL_STOP);
+  return TAI_CONTINUE(int, hook_ref[2]);
+}
+
+static int usb_thread(SceSize args, void *argp)
+{
+  (void)args;
+  (void)argp;
+
+  ksceKernelPrintf("\n");
+  ksceKernelPrintf("start catlog usb_thread\n");
+  ksceKernelPrintf("\n");
+
+  while (g_usb_running)
+  {
+    char buf[0x400];
+    int received_len = ringbuf_get_wait(&usb_ring, buf, sizeof(buf), NULL);
+
+    int ret = 0;
+  connect:
+    ret = sceUsbSerialStatusForDriver();
+    if (ret != (int)0x80244401)
+    {
+      if (ret == 1)
+      {
+        goto send;
+      }
+      ksceKernelDelayThread(1000 * 1000);
+      if (ret == 0)
+      {
+        goto connect;
+      }
+    }
+
+    ksceKernelWaitEventFlag(g_usb_flag_uid, SERIAL_STOP, SCE_EVENT_WAITCLEAR, NULL, 0);
+
+    sceUsbSerialStartForDriver();
+    sceUsbSerialSetupForDriver(1);
+    if (ret == (int)0x80244403)
+    {
+      SceUsbSerialForDriver_6AA4EFA4();
+      sceUsbSerialSetupForDriver(1);
+    }
+    ksceKernelSetEventFlag(g_usb_flag_uid, SERIAL_READY);
+
+  send:
+    if (received_len == 0)
+    {
+      continue;
+    }
+
+    ksceKernelClearEventFlag(g_usb_flag_uid, SERIAL_READY);
+
+    if (sceUsbSerialSendForDriver(buf, received_len, 0, -1) < 0)
+    {
+      ksceKernelSetEventFlag(g_usb_flag_uid, SERIAL_STOP);
+      ksceKernelDelayThread(1000 * 1000);
+      goto connect;
+    }
+
+    received_len = ringbuf_get_wait(&usb_ring, buf, sizeof(buf), (SceUInt[]) {1000 * 1000});
+    ksceKernelSetEventFlag(g_usb_flag_uid, SERIAL_READY);
+    if (received_len > 0)
+    {
+      goto send;
+    }
   }
 
   return 0;
@@ -341,6 +461,82 @@ end:
 }
 
 
+static int usb_serial_init(void)
+{
+  int ret;
+  tai_module_info_t usbInfo;
+  usbInfo.size = sizeof(tai_module_info_t);
+
+  g_usb_flag_uid = ksceKernelCreateEventFlag("CatLog USB Flag", 0, SERIAL_STOP, NULL);
+  if (g_usb_flag_uid < 0)
+  {
+    ret = g_usb_flag_uid;
+    goto end;
+  }
+
+  hook[0] = taiHookFunctionExportForKernel(KERNEL_PID, &hook_ref[0], "SceUsbMtp", TAI_ANY_LIBRARY, 0x6FC97594, SceUsbMtpForDriver_6FC97594_patched);
+  hook[1] = taiHookFunctionExportForKernel(KERNEL_PID, &hook_ref[1], "SceUsbstorVStorDriver", TAI_ANY_LIBRARY, 0xB606F1AF, sceUsbstorVStorStart_patched);
+  hook[2] = taiHookFunctionExportForKernel(KERNEL_PID, &hook_ref[2], "SceUsbstorVStorDriver", TAI_ANY_LIBRARY, 0x0FD67059, sceUsbstorVStorStop_patched);
+
+  if (taiGetModuleInfoForKernel(KERNEL_PID, "SceUsbSerial", &usbInfo) < 0)
+  {
+    ret = -1;
+    goto end;
+  }
+
+  ret = module_get_offset(KERNEL_PID, usbInfo.modid, 0, 0x1E78 | 1, (uintptr_t *)&sceUsbSerialStatusForDriver);
+  if (ret < 0)
+  {
+    goto end;
+  }
+
+  ret = module_get_offset(KERNEL_PID, usbInfo.modid, 0, 0x168C | 1, (uintptr_t *)&sceUsbSerialStartForDriver);
+  if (ret < 0)
+  {
+    goto end;
+  }
+
+  ret = module_get_offset(KERNEL_PID, usbInfo.modid, 0, 0x17A0 | 1, (uintptr_t *)&sceUsbSerialSetupForDriver);
+  if (ret < 0)
+  {
+    goto end;
+  }
+
+  ret = module_get_offset(KERNEL_PID, usbInfo.modid, 0, 0x18F4 | 1, (uintptr_t *)&SceUsbSerialForDriver_6AA4EFA4);
+  if (ret < 0)
+  {
+    goto end;
+  }
+
+  ret = module_get_offset(KERNEL_PID, usbInfo.modid, 0, 0x1A68 | 1, (uintptr_t *)&sceUsbSerialSendForDriver);
+  if (ret < 0)
+  {
+    goto end;
+  }
+
+  ret = module_get_offset(KERNEL_PID, usbInfo.modid, 0, 0x1738 | 1, (uintptr_t *)&sceUsbSerialCloseForDriver);
+  if (ret < 0)
+  {
+    goto end;
+  }
+
+  g_usb_thread_uid = ksceKernelCreateThread("usb_thread", usb_thread, 0x40, 0x1000, 0, 0, 0);
+  if (g_usb_thread_uid < 0)
+  {
+    ret = g_usb_thread_uid;
+    goto end;
+  }
+
+  g_usb_running = 1;
+
+  ksceKernelStartThread(g_usb_thread_uid, 0, NULL);
+
+  ret = 0;
+
+end:
+  return ret;
+}
+
 int CatLogInit(void)
 {
   int ret;
@@ -358,9 +554,16 @@ int CatLogInit(void)
     goto end;
   }
 
-  ret = ringbuf_init(RINGBUF_LEN);
+  ret = ringbuf_init(&net_ring, RINGBUF_LEN);
   if (ret < 0)
   {
+    goto end;
+  }
+
+  ret = ringbuf_init(&usb_ring, RINGBUF_LEN);
+  if (ret < 0)
+  {
+    ringbuf_term(&net_ring);
     goto end;
   }
 
@@ -427,6 +630,13 @@ int CatLogInit(void)
   net_thread_run = 1;
 
   ksceKernelStartThread(net_thread_uid, 0, NULL);
+
+  ret = usb_serial_init();
+  if (ret < 0)
+  {
+    ksceKernelPrintf("catlog: usb serial init failed %x\n", ret);
+    ret = 0;
+  }
 
   ret = 0;
 

@@ -25,126 +25,125 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #define SCE_KERNEL_ATTR_THREAD_FIFO (0x00000000U)
 #define RINGBUF_EVF_NON_EMPTY 0x00000001
 
-static SceUID evf_uid      = -1;
-static SceUID mtx_uid      = -1;
-static SceUID memblock_uid = -1;
-
-static int buf_len    = 0;
-static char *base_ptr = NULL;
-static char *get_ptr  = NULL;
-static char *put_ptr  = NULL;
-
-static int idx(char *ptr)
+static int idx(RingBuf *rb, char *ptr)
 {
-  return (unsigned int)ptr % buf_len;
+  return (unsigned int)(ptr - rb->base_ptr) % rb->buf_len;
 }
 
-static void inc(char **ptr)
+static void inc(RingBuf *rb, char **ptr)
 {
-  *ptr = base_ptr + idx(*ptr + 1);
+  *ptr = rb->base_ptr + idx(rb, *ptr + 1);
 }
 
-static int empty(void)
+static int empty(RingBuf *rb)
 {
-  return get_ptr == put_ptr;
+  return rb->get_ptr == rb->put_ptr;
 }
 
-static int full(void)
+static int full(RingBuf *rb)
 {
-  return idx(put_ptr + 1) == idx(get_ptr);
+  return idx(rb, rb->put_ptr + 1) == idx(rb, rb->get_ptr);
 }
 
-static int put(char c)
+static int put(RingBuf *rb, char c)
 {
-  if (full())
+  if (full(rb))
   {
     return -1;
   }
-  *put_ptr = c;
-  inc(&put_ptr);
+  *rb->put_ptr = c;
+  inc(rb, &rb->put_ptr);
   return 0;
 }
 
-static int put_clobber(char c)
+static int put_clobber(RingBuf *rb, char c)
 {
-  if (full())
+  if (full(rb))
   {
-    inc(&get_ptr);
+    inc(rb, &rb->get_ptr);
   }
-  *put_ptr = c;
-  inc(&put_ptr);
+  *rb->put_ptr = c;
+  inc(rb, &rb->put_ptr);
   return 0;
 }
 
-static int get(char *c)
+static int get(RingBuf *rb, char *c)
 {
-  if (empty())
+  if (empty(rb))
   {
     return -1;
   }
-  *c = *get_ptr;
-  inc(&get_ptr);
+  *c = *rb->get_ptr;
+  inc(rb, &rb->get_ptr);
   return 0;
 }
 
-int ringbuf_init(int size)
+int ringbuf_init(RingBuf *rb, int size)
 {
   int ret = 0;
 
-  evf_uid = ksceKernelCreateEventFlag("RingBufferEventFlag", SCE_KERNEL_ATTR_THREAD_FIFO | SCE_EVENT_WAITMULTIPLE,
-                                      0x00000000, NULL);
-  if (evf_uid < 0)
+  rb->evf_uid      = -1;
+  rb->mtx_uid      = -1;
+  rb->memblock_uid = -1;
+  rb->buf_len      = 0;
+  rb->base_ptr     = NULL;
+  rb->get_ptr      = NULL;
+  rb->put_ptr      = NULL;
+
+  rb->evf_uid = ksceKernelCreateEventFlag("RingBufferEventFlag", SCE_KERNEL_ATTR_THREAD_FIFO | SCE_EVENT_WAITMULTIPLE,
+                                          0x00000000, NULL);
+  if (rb->evf_uid < 0)
   {
-    ret = evf_uid;
+    ret = rb->evf_uid;
     goto fail_evf;
   }
 
-  mtx_uid = ksceKernelCreateMutex("RingBufferMutex", SCE_KERNEL_ATTR_THREAD_FIFO, 0, NULL);
-  if (mtx_uid < 0)
+  rb->mtx_uid = ksceKernelCreateMutex("RingBufferMutex", SCE_KERNEL_ATTR_THREAD_FIFO, 0, NULL);
+  if (rb->mtx_uid < 0)
   {
-    ret = mtx_uid;
+    ret = rb->mtx_uid;
     goto fail_mtx;
   }
 
-  memblock_uid = ksceKernelAllocMemBlock("RingBufferMemBlock", 0x6020D006, size, NULL);
-  if (memblock_uid < 0)
+  rb->memblock_uid = ksceKernelAllocMemBlock("RingBufferMemBlock", 0x6020D006, size, NULL);
+  if (rb->memblock_uid < 0)
   {
-    ret = memblock_uid;
+    ret = rb->memblock_uid;
     goto fail_memblock;
   }
-  ksceKernelGetMemBlockBase(memblock_uid, (void **)&base_ptr);
+  ksceKernelGetMemBlockBase(rb->memblock_uid, (void **)&rb->base_ptr);
 
-  buf_len = size;
-  get_ptr = put_ptr = base_ptr;
+  rb->buf_len = size;
+  rb->get_ptr = rb->put_ptr = rb->base_ptr;
   return 0;
 
 fail_memblock:
-  ksceKernelDeleteMutex(mtx_uid);
+  ksceKernelDeleteMutex(rb->mtx_uid);
 fail_mtx:
-  ksceKernelDeleteEventFlag(evf_uid);
+  ksceKernelDeleteEventFlag(rb->evf_uid);
 fail_evf:
   return ret;
 }
 
-int ringbuf_term(void)
+int ringbuf_term(RingBuf *rb)
 {
-  ksceKernelDeleteEventFlag(evf_uid);
-  ksceKernelDeleteMutex(mtx_uid);
-  ksceKernelFreeMemBlock(memblock_uid);
-  mtx_uid = memblock_uid = -1;
-  buf_len                = 0;
-  base_ptr = get_ptr = put_ptr = NULL;
+  ksceKernelDeleteEventFlag(rb->evf_uid);
+  ksceKernelDeleteMutex(rb->mtx_uid);
+  ksceKernelFreeMemBlock(rb->memblock_uid);
+  rb->mtx_uid = rb->memblock_uid = -1;
+  rb->buf_len = 0;
+  rb->base_ptr = rb->get_ptr = rb->put_ptr = NULL;
   return 0;
 }
 
-int ringbuf_put(char *c, int size)
+int ringbuf_put(RingBuf *rb, char *c, int size)
 {
   int n_put = 0;
-  ksceKernelLockMutex(mtx_uid, 1, NULL);
+  ksceKernelLockMutex(rb->mtx_uid, 1, NULL);
 
   while (size-- > 0)
   {
-    if (put(*c++) == 0)
+    if (put(rb, *c++) == 0)
     {
       n_put++;
     }
@@ -156,41 +155,41 @@ int ringbuf_put(char *c, int size)
 
   if (n_put > 0)
   {
-    ksceKernelSetEventFlag(evf_uid, RINGBUF_EVF_NON_EMPTY);
+    ksceKernelSetEventFlag(rb->evf_uid, RINGBUF_EVF_NON_EMPTY);
   }
 
-  ksceKernelUnlockMutex(mtx_uid, 1);
+  ksceKernelUnlockMutex(rb->mtx_uid, 1);
   return n_put;
 }
 
-int ringbuf_put_clobber(char *c, int size)
+int ringbuf_put_clobber(RingBuf *rb, char *c, int size)
 {
   int n_put = 0;
-  ksceKernelLockMutex(mtx_uid, 1, NULL);
+  ksceKernelLockMutex(rb->mtx_uid, 1, NULL);
 
   while (size-- > 0)
   {
-    put_clobber(*c++);
+    put_clobber(rb, *c++);
     n_put++;
   }
 
   if (n_put > 0)
   {
-    ksceKernelSetEventFlag(evf_uid, RINGBUF_EVF_NON_EMPTY);
+    ksceKernelSetEventFlag(rb->evf_uid, RINGBUF_EVF_NON_EMPTY);
   }
 
-  ksceKernelUnlockMutex(mtx_uid, 1);
+  ksceKernelUnlockMutex(rb->mtx_uid, 1);
   return n_put;
 }
 
-int ringbuf_get(char *c, int size)
+int ringbuf_get(RingBuf *rb, char *c, int size)
 {
   int n_get = 0;
-  ksceKernelLockMutex(mtx_uid, 1, NULL);
+  ksceKernelLockMutex(rb->mtx_uid, 1, NULL);
 
   while (size-- > 0)
   {
-    if (get(c++) == 0)
+    if (get(rb, c++) == 0)
     {
       n_get++;
     }
@@ -200,28 +199,28 @@ int ringbuf_get(char *c, int size)
     }
   }
 
-  if (empty())
+  if (empty(rb))
   {
-    ksceKernelClearEventFlag(evf_uid, ~RINGBUF_EVF_NON_EMPTY);
+    ksceKernelClearEventFlag(rb->evf_uid, ~RINGBUF_EVF_NON_EMPTY);
   }
 
-  ksceKernelUnlockMutex(mtx_uid, 1);
+  ksceKernelUnlockMutex(rb->mtx_uid, 1);
   return n_get;
 }
 
-int ringbuf_get_wait(char *c, int size, SceUInt *timeout)
+int ringbuf_get_wait(RingBuf *rb, char *c, int size, SceUInt *timeout)
 {
   int n_get = 0;
-  int ret   = ksceKernelWaitEventFlag(evf_uid, RINGBUF_EVF_NON_EMPTY, SCE_EVENT_WAITAND, NULL, timeout);
+  int ret   = ksceKernelWaitEventFlag(rb->evf_uid, RINGBUF_EVF_NON_EMPTY, SCE_EVENT_WAITAND, NULL, timeout);
   if (ret < 0)
   {
     goto done;
   }
-  ksceKernelLockMutex(mtx_uid, 1, NULL);
+  ksceKernelLockMutex(rb->mtx_uid, 1, NULL);
 
   while (size-- > 0)
   {
-    if (get(c++) == 0)
+    if (get(rb, c++) == 0)
     {
       n_get++;
     }
@@ -231,12 +230,12 @@ int ringbuf_get_wait(char *c, int size, SceUInt *timeout)
     }
   }
 
-  if (empty())
+  if (empty(rb))
   {
-    ksceKernelClearEventFlag(evf_uid, ~RINGBUF_EVF_NON_EMPTY);
+    ksceKernelClearEventFlag(rb->evf_uid, ~RINGBUF_EVF_NON_EMPTY);
   }
 
-  ksceKernelUnlockMutex(mtx_uid, 1);
+  ksceKernelUnlockMutex(rb->mtx_uid, 1);
 done:
   return n_get;
 }

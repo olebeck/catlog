@@ -35,6 +35,7 @@ target_link_libraries("${ELF}"
   SceModulemgrForDriver_stub
   SceIofilemgrForDriver_stub
   SceDebugForDriver_stub
+  SceUdcdForDriver_stub
 )
 
 vita_create_self("${SELF}"

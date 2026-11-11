@@ -22,12 +22,23 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <psp2kern/types.h>
 
-int ringbuf_init(int size);
-int ringbuf_term(void);
+typedef struct RingBuf {
+  SceUID evf_uid;
+  SceUID mtx_uid;
+  SceUID memblock_uid;
 
-int ringbuf_put(char *c, int size);
-int ringbuf_put_clobber(char *c, int size);
-int ringbuf_get(char *c, int size);
-int ringbuf_get_wait(char *c, int size, SceUInt *timeout);
+  int buf_len;
+  char *base_ptr;
+  char *get_ptr;
+  char *put_ptr;
+} RingBuf;
+
+int ringbuf_init(RingBuf *rb, int size);
+int ringbuf_term(RingBuf *rb);
+
+int ringbuf_put(RingBuf *rb, char *c, int size);
+int ringbuf_put_clobber(RingBuf *rb, char *c, int size);
+int ringbuf_get(RingBuf *rb, char *c, int size);
+int ringbuf_get_wait(RingBuf *rb, char *c, int size, SceUInt *timeout);
 
 #endif
